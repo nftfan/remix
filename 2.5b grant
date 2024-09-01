@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+contract TokenDistributor is Ownable {
+    IERC20 public token;
+    uint256 public claimAmount = 2500000000 * 10**18; // Adjust decimals as per your token
+    uint256 public claimInterval = 24 hours; // 24 hours delay
+
+    mapping(address => uint256) public lastClaimedTime;
+
+    constructor(IERC20 _token) Ownable(msg.sender) { 
+        token = _token;
+    }
+
+    function claimTokens() external {
+        require(block.timestamp >= lastClaimedTime[msg.sender] + claimInterval, "Claim not yet available.");
+        require(token.balanceOf(address(this)) >= claimAmount, "Not enough tokens in contract.");
+
+        lastClaimedTime[msg.sender] = block.timestamp;
+        token.transfer(msg.sender, claimAmount);
+    }
+
+    function depositTokens(uint256 _amount) external onlyOwner {
+        require(token.transferFrom(msg.sender, address(this), _amount), "Token transfer failed.");
+    }
+
+    function withdrawTokens(uint256 _amount) external onlyOwner {
+        require(token.transfer(msg.sender, _amount), "Token transfer failed.");
+    }
+
+    function updateClaimAmount(uint256 _newAmount) external onlyOwner {
+        claimAmount = _newAmount;
+    }
+
+    function updateClaimInterval(uint256 _newInterval) external onlyOwner {
+        claimInterval = _newInterval;
+    }
+}
