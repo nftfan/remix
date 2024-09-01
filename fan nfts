@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC1155/extensions/ERC1155URIStorage.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+contract NFTFANS is ERC1155URIStorage, Ownable {
+
+    string public name;
+    string public supply;
+    string public Twitter;
+
+    constructor(address initialOwner) ERC1155("") Ownable(initialOwner) {}
+
+    function mint(address _to, uint256 _tokenId, uint256 _amount, string calldata _uri) external onlyOwner {
+        _mint(_to, _tokenId, _amount, "");
+        _setTokenURI(_tokenId, _uri);
+        name = "NFT FANS";
+        supply = "20";
+        Twitter = "@nftfanstoken";
+    }
+
+    function _setTokenURI(uint256 tokenId,  string memory _uri) internal {
+        _setURI(tokenId, _uri);
+    }
+}
