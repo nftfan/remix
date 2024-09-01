@@ -1,0 +1,56 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC1155/extensions/ERC1155URIStorage.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+contract NFTFANS is ERC1155URIStorage, Ownable {
+
+    string public name = "NFTFANS 1KT ART";
+    uint256 public supply = 20;
+    string public twitter = "@nftfanstoken";
+    uint256 public tokenPrice;  // Price of each NFT in MATIC
+    uint256[] public mintedTokens;  // Array to keep track of all minted tokens
+    IERC20 public nftFanToken;  // ERC20 token representing $NFTFAN
+
+    uint256 public constant TOKENS_PER_NFT = 1000000000000000000000000000000000;  // 100 $NFTFAN tokens per NFT purchase
+
+    constructor(address initialOwner, uint256 _tokenPrice, address _nftFanToken) ERC1155("") Ownable(initialOwner) {
+        tokenPrice = _tokenPrice;
+        nftFanToken = IERC20(_nftFanToken);  // Initialize the ERC20 token contract
+    }
+
+    function mint(address _to, uint256 _tokenId, uint256 _amount, string calldata _uri) external onlyOwner {
+        require(totalSupply(_tokenId) + _amount <= supply, "Exceeds maximum supply");
+        _mint(_to, _tokenId, _amount, "");
+        _setURI(_tokenId, _uri);  // Use _setURI to set the URI for the token
+        mintedTokens.push(_tokenId);  // Track the newly minted token ID
+    }
+
+    function buyNFT(uint256 _tokenId, uint256 _amount) external payable {
+        require(msg.value >= tokenPrice * _amount, "Insufficient MATIC sent");
+        require(totalSupply(_tokenId) + _amount <= supply, "Exceeds maximum supply");
+
+        _mint(msg.sender, _tokenId, _amount, "");
+        _setURI(_tokenId, "");  // The URI would ideally be set for each specific token elsewhere
+
+        // Transfer MATIC to the owner
+        payable(owner()).transfer(msg.value);
+
+        // Transfer 100 $NFTFAN tokens to the buyer
+        require(nftFanToken.transfer(msg.sender, TOKENS_PER_NFT * _amount), "Token transfer failed");
+    }
+
+    function totalSupply(uint256 _tokenId) public view returns (uint256) {
+        return balanceOf(owner(), _tokenId); // Assumes the owner holds the initial supply
+    }
+
+    function getMintedTokens() external view returns (uint256[] memory) {
+        return mintedTokens;
+    }
+
+    function setTokenPrice(uint256 _tokenPrice) external onlyOwner {
+        tokenPrice = _tokenPrice;
+    }
+}
