@@ -1,0 +1,354 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/interfaces/IERC2981.sol";
+
+contract CoinFunNFT is ERC1155, Ownable, IERC2981 {
+    struct NFTMeta {
+        string tokenURI;
+        uint256 price;          // Default price in wei (MATIC)
+        bool forSale;
+        address originalCreator;
+        uint256 maxSupply;      // Max supply for this token ID
+        uint256 currentSupply;  // Current minted supply
+    }
+
+    struct Listing {
+        address seller;
+        uint256 amount;
+        uint256 price; // In wei
+    }
+
+    // Collection info
+    string public constant name = "Coin Fun";
+    string public constant symbol = "CFN";
+    
+    // Royalty system
+    uint256 public royaltyBasisPoints = 100; // 1% = 100 basis points (out of 10000)
+    address public royaltyReceiver;
+    
+    uint256 public nextTokenId = 1;
+    mapping(uint256 => NFTMeta) public nftInfo;      // tokenId => meta
+    mapping(uint256 => uint256) public shopInventory; // tokenId => amount owned by shop (admin + user listings)
+    mapping(uint256 => Listing[]) public listings;    // tokenId => array of user listings
+
+    event NFTMinted(uint256 indexed tokenId, address creator, string tokenURI, uint256 price, uint256 amount);
+    event NFTBought(uint256 indexed tokenId, address buyer, address seller, uint256 price, uint256 amount, uint256 royaltyPaid);
+    event NFTListed(uint256 indexed tokenId, address seller, uint256 price, uint256 amount);
+    event NFTUnlisted(uint256 indexed tokenId);
+    event ListingCancelled(uint256 indexed tokenId, address seller, uint256 listingIndex, uint256 amount);
+    event RoyaltyUpdated(uint256 newRoyaltyBasisPoints);
+    event RoyaltyReceiverUpdated(address newReceiver);
+
+    uint256 public constant MAX_TOKEN_TYPES = 10000;
+    uint256 public constant MAX_ROYALTY_BASIS_POINTS = 1000; // 10% maximum
+
+    constructor() ERC1155("") Ownable(msg.sender) {
+        royaltyReceiver = msg.sender; // Owner receives royalties by default
+    }
+
+    // Handle ERC1155 token receipts
+    function onERC1155Received(
+        address,
+        address,
+        uint256,
+        uint256,
+        bytes memory
+    ) public virtual returns (bytes4) {
+        return this.onERC1155Received.selector;
+    }
+
+    function onERC1155BatchReceived(
+        address,
+        address,
+        uint256[] memory,
+        uint256[] memory,
+        bytes memory
+    ) public virtual returns (bytes4) {
+        return this.onERC1155BatchReceived.selector;
+    }
+
+    // EIP-2981 Royalty Standard implementation
+    function royaltyInfo(uint256 tokenId, uint256 salePrice) 
+        external 
+        view 
+        override 
+        returns (address receiver, uint256 royaltyAmount) 
+    {
+        if (tokenId > 0 && tokenId < nextTokenId) {
+            receiver = royaltyReceiver;
+            royaltyAmount = (salePrice * royaltyBasisPoints) / 10000;
+        }
+    }
+
+    // Update royalty percentage (only owner)
+    function setRoyalty(uint256 _royaltyBasisPoints) external onlyOwner {
+        require(_royaltyBasisPoints <= MAX_ROYALTY_BASIS_POINTS, "Royalty too high");
+        royaltyBasisPoints = _royaltyBasisPoints;
+        emit RoyaltyUpdated(_royaltyBasisPoints);
+    }
+
+    // Update royalty receiver (only owner)
+    function setRoyaltyReceiver(address _royaltyReceiver) external onlyOwner {
+        require(_royaltyReceiver != address(0), "Invalid address");
+        royaltyReceiver = _royaltyReceiver;
+        emit RoyaltyReceiverUpdated(_royaltyReceiver);
+    }
+
+    // Mint NFT to shop, only owner (admin) can mint
+    function mintNFT(
+        string memory _tokenURI, 
+        uint256 _price, 
+        uint256 _maxSupply, 
+        uint256 _amount
+    ) external onlyOwner {
+        require(nextTokenId <= MAX_TOKEN_TYPES, "Max token types reached");
+        require(_price > 0, "Price must be set");
+        require(_maxSupply > 0, "Max supply must be set");
+        require(_amount > 0, "Amount must be greater than 0");
+
+        uint256 tokenId = nextTokenId++;
+        
+        // For new token ID
+        nftInfo[tokenId] = NFTMeta({
+            tokenURI: _tokenURI,
+            price: _price,
+            forSale: true,
+            originalCreator: msg.sender,
+            maxSupply: _maxSupply,
+            currentSupply: _amount
+        });
+
+        shopInventory[tokenId] = _amount;
+        _mint(address(this), tokenId, _amount, "");
+        
+        emit NFTMinted(tokenId, msg.sender, _tokenURI, _price, _amount);
+    }
+
+    // Mint additional supply for existing token ID
+    function mintAdditional(uint256 tokenId, uint256 _amount) external onlyOwner {
+        require(tokenId > 0 && tokenId < nextTokenId, "Token does not exist");
+        NFTMeta storage meta = nftInfo[tokenId];
+        require(meta.currentSupply + _amount <= meta.maxSupply, "Exceeds max supply");
+        
+        meta.currentSupply += _amount;
+        shopInventory[tokenId] += _amount;
+        _mint(address(this), tokenId, _amount, "");
+        
+        emit NFTMinted(tokenId, meta.originalCreator, meta.tokenURI, meta.price, _amount);
+    }
+
+    // Buy NFT from shop or user listing (with royalty calculation)
+    function buyNFT(uint256 tokenId, uint256 amount) external payable {
+        NFTMeta storage meta = nftInfo[tokenId];
+        require(meta.forSale, "NFT not for sale");
+
+        uint256 remaining = amount;
+        uint256 totalCost = 0;
+        uint256 totalRoyalty = 0;
+
+        // First buy from user listings, FIFO
+        Listing[] storage ls = listings[tokenId];
+        for (uint256 i = 0; i < ls.length && remaining > 0; i++) {
+            Listing storage l = ls[i];
+            if (l.amount == 0) continue;
+
+            uint256 buyAmount = remaining > l.amount ? l.amount : remaining;
+            uint256 buyPrice = l.price * buyAmount;
+            
+            // Calculate royalty for secondary sales (user listings)
+            uint256 royalty = (buyPrice * royaltyBasisPoints) / 10000;
+            uint256 sellerReceives = buyPrice - royalty;
+            
+            totalCost += buyPrice;
+            totalRoyalty += royalty;
+
+            // Transfer funds to seller (minus royalty)
+            payable(l.seller).transfer(sellerReceives);
+            
+            // Transfer royalty to royalty receiver
+            if (royalty > 0) {
+                payable(royaltyReceiver).transfer(royalty);
+            }
+
+            // Transfer NFTs to buyer
+            _safeTransferFrom(address(this), msg.sender, tokenId, buyAmount, "");
+
+            emit NFTBought(tokenId, msg.sender, l.seller, l.price, buyAmount, royalty);
+
+            l.amount -= buyAmount;
+            shopInventory[tokenId] -= buyAmount;
+            remaining -= buyAmount;
+        }
+
+        // Remove fully fulfilled listings
+        uint256 len = ls.length;
+        while (len > 0 && ls[0].amount == 0) {
+            for (uint256 j = 1; j < len; j++) {
+                ls[j-1] = ls[j];
+            }
+            ls.pop();
+            len = ls.length;
+        }
+
+        // If there is still demand, sell from shop (admin - no royalty on primary sales)
+        if (remaining > 0) {
+            require(shopInventory[tokenId] >= remaining, "Not enough in shop inventory");
+            uint256 adminPrice = meta.price * remaining;
+            totalCost += adminPrice;
+
+            // Transfer NFTs to buyer from shop inventory
+            _safeTransferFrom(address(this), msg.sender, tokenId, remaining, "");
+            shopInventory[tokenId] -= remaining;
+
+            // Forward funds to contract owner (shop) - no royalty on primary sales
+            payable(owner()).transfer(adminPrice);
+
+            emit NFTBought(tokenId, msg.sender, owner(), meta.price, remaining, 0);
+
+            remaining = 0;
+        }
+
+        require(msg.value == totalCost, "Incorrect price paid");
+    }
+
+    // List your NFT for sale (from user to shop)
+    function sellNFT(uint256 tokenId, uint256 amount, uint256 _price) external {
+        require(balanceOf(msg.sender, tokenId) >= amount, "Not enough tokens");
+        require(_price > 0, "Price must be set");
+
+        // Transfer NFT to shop contract
+        _safeTransferFrom(msg.sender, address(this), tokenId, amount, "");
+
+        // Add to user listings
+        listings[tokenId].push(Listing({
+            seller: msg.sender,
+            amount: amount,
+            price: _price
+        }));
+
+        shopInventory[tokenId] += amount; // User-listed NFTs are tracked in shopInventory too
+
+        emit NFTListed(tokenId, msg.sender, _price, amount);
+    }
+
+    // Cancel a user's own listing and withdraw unsold NFTs
+    function cancelListing(uint256 tokenId, uint256 listingIndex) external {
+        Listing[] storage ls = listings[tokenId];
+        require(listingIndex < ls.length, "Invalid listing index");
+        Listing storage l = ls[listingIndex];
+
+        require(l.seller == msg.sender, "Not your listing");
+        require(l.amount > 0, "Listing already sold out");
+
+        uint256 amountToReturn = l.amount;
+
+        // Return NFTs to the seller
+        _safeTransferFrom(address(this), msg.sender, tokenId, amountToReturn, "");
+
+        shopInventory[tokenId] -= amountToReturn;
+        l.amount = 0;
+
+        emit ListingCancelled(tokenId, msg.sender, listingIndex, amountToReturn);
+    }
+
+    // Unlist NFT (admin only, e.g. to remove from shop)
+    function unlistNFT(uint256 tokenId) external onlyOwner {
+        require(shopInventory[tokenId] > 0, "No tokens in shop");
+        nftInfo[tokenId].forSale = false;
+        emit NFTUnlisted(tokenId);
+    }
+
+    // Get all NFTs info (IDs and metadata) for shop display
+    function getShopNFTs() external view returns (
+        uint256[] memory ids,
+        string[] memory uris,
+        uint256[] memory prices,
+        bool[] memory isForSale,
+        uint256[] memory shopAmounts,
+        uint256[] memory maxSupplies,
+        uint256[] memory currentSupplies
+    ) {
+        uint256 total = nextTokenId - 1;
+        ids = new uint256[](total);
+        uris = new string[](total);
+        prices = new uint256[](total);
+        isForSale = new bool[](total);
+        shopAmounts = new uint256[](total);
+        maxSupplies = new uint256[](total);
+        currentSupplies = new uint256[](total);
+
+        for (uint256 i = 0; i < total; i++) {
+            uint256 id = i + 1;
+            ids[i] = id;
+            uris[i] = nftInfo[id].tokenURI;
+            prices[i] = nftInfo[id].price;
+            isForSale[i] = nftInfo[id].forSale && shopInventory[id] > 0;
+            shopAmounts[i] = shopInventory[id];
+            maxSupplies[i] = nftInfo[id].maxSupply;
+            currentSupplies[i] = nftInfo[id].currentSupply;
+        }
+    }
+
+    // Returns metadata URI for a token
+    function uri(uint256 tokenId) public view override returns (string memory) {
+        require(tokenId > 0 && tokenId < nextTokenId, "Token does not exist");
+        return nftInfo[tokenId].tokenURI;
+    }
+
+    // Returns all token IDs and amounts owned by user
+    function tokensOfOwner(address user) external view returns (
+        uint256[] memory tokenIds, 
+        uint256[] memory amounts
+    ) {
+        uint256 total = nextTokenId - 1;
+        uint256 count = 0;
+        
+        // Count how many different tokens user owns
+        for (uint256 i = 1; i <= total; i++) {
+            if (balanceOf(user, i) > 0) {
+                count++;
+            }
+        }
+        
+        tokenIds = new uint256[](count);
+        amounts = new uint256[](count);
+        uint256 idx = 0;
+        
+        for (uint256 i = 1; i <= total; i++) {
+            uint256 balance = balanceOf(user, i);
+            if (balance > 0) {
+                tokenIds[idx] = i;
+                amounts[idx] = balance;
+                idx++;
+            }
+        }
+    }
+
+    // Get shop inventory for a specific token
+    function getShopInventory(uint256 tokenId) external view returns (uint256) {
+        return shopInventory[tokenId];
+    }
+
+    // Check if token exists
+    function exists(uint256 tokenId) external view returns (bool) {
+        return tokenId > 0 && tokenId < nextTokenId;
+    }
+
+    // Get all user listings for a token
+    function getListings(uint256 tokenId) external view returns (Listing[] memory) {
+        return listings[tokenId];
+    }
+
+    // Get current royalty info
+    function getRoyaltyInfo() external view returns (uint256 basisPoints, address receiver) {
+        return (royaltyBasisPoints, royaltyReceiver);
+    }
+
+    // Support for EIP-165
+    function supportsInterface(bytes4 interfaceId) public view virtual override(ERC1155, IERC165) returns (bool) {
+        return interfaceId == type(IERC2981).interfaceId || super.supportsInterface(interfaceId);
+    }
+}
